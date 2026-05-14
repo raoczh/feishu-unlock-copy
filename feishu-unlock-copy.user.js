@@ -2,7 +2,7 @@
 // @name         一键复制飞书文档全部内容
 // @name:zh-CN   一键复制飞书文档全部内容
 // @namespace    https://github.com/raoczh
-// @version      1.5.1
+// @version      1.5.2
 // @description  一键复制飞书云文档（Wiki/Docs/Docx）禁止复制、禁止选中、禁止右键的限制内容，点击即可复制全部内容
 // @description:zh-CN  一键复制飞书云文档（Wiki/Docs/Docx）禁止复制、禁止选中、禁止右键的限制内容，点击即可复制全部内容
 // @author       raoczh (https://github.com/raoczh)
@@ -346,6 +346,56 @@
   // ============================================================
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // 把一个内容节点（.ace-line 或独立图片块）转成文本。
+  // 图片用 ![alt](src) 形式嵌入，既是纯文本，粘到 Markdown 编辑器又能被渲染成图片。
+  // 注意：飞书图片是独立的 [data-block-type="image"] 块，并不在 .ace-line 内，需要单独处理。
+  // 图片链接是带鉴权的临时 URL，需要登录态才能访问。
+  const nodeToTextWithImages = (node) => {
+    try {
+      // 独立图片块：直接取内部 <img> 的 src
+      if (
+        node.getAttribute &&
+        node.getAttribute("data-block-type") === "image"
+      ) {
+        const img = node.querySelector("img");
+        if (!img) return "";
+        const src =
+          img.getAttribute("data-src") ||
+          img.getAttribute("src") ||
+          img.src ||
+          "";
+        const alt = img.alt || "图片";
+        return src ? `![${alt}](${src})` : "";
+      }
+
+      // .ace-line：遍历 DOM，遇到 img 转 ![alt](src)，br 转换行，其他保留文本
+      let out = "";
+      const walk = (n) => {
+        if (n.nodeType === Node.TEXT_NODE) {
+          out += n.textContent;
+        } else if (n.nodeType === Node.ELEMENT_NODE) {
+          if (n.tagName === "IMG") {
+            const src =
+              n.getAttribute("data-src") ||
+              n.getAttribute("src") ||
+              n.src ||
+              "";
+            const alt = n.alt || "图片";
+            if (src) out += `![${alt}](${src})`;
+          } else if (n.tagName === "BR") {
+            out += "\n";
+          } else {
+            for (const c of n.childNodes) walk(c);
+          }
+        }
+      };
+      walk(node);
+      return out;
+    } catch (_) {
+      return node.innerText || node.textContent || "";
+    }
+  };
+
   // 找出主滚动容器：测试所有候选（窗口 + .ace-line 的 scrollable 祖先），
   // 选择 scrollHeight - clientHeight 最大的那个。
   // 一次只能用一个容器 —— 多容器并发滚动会让 Y 坐标体系不一致，无法统一排序。
@@ -381,6 +431,8 @@
   // 改用"DOM 先序合并"——每次扫描记录当前 DOM 中 block 的先序，逐步合并到全局有序数组。
   // DOM 先序天然反映"先左栏后右栏、先上后下"的真实视觉顺序，且对虚拟滚动稳定。
   // map value: { blockKey, lineNum, lineIdx, y, text }
+  // 同时收集 .ace-line 和 [data-block-type="image"] 块。图片块自身就是 block 节点，
+  // 不在 .ace-line 内，所以查询里必须显式带上，否则纯文本里永远拿不到图片链接。
   const harvestVisibleLines = (map, container, blockOrder, blockOrderSet) => {
     const isWindow =
       container === document.scrollingElement ||
@@ -391,7 +443,9 @@
       : container.scrollTop;
     const cRectTop = isWindow ? 0 : container.getBoundingClientRect().top;
 
-    const lines = document.querySelectorAll(".ace-line");
+    const nodes = document.querySelectorAll(
+      ".ace-line, [data-block-type='image']",
+    );
 
     // 把 block 标识统一为字符串 key —— 优先 record-id（最稳），其次 block-id 加前缀避免冲突
     const blockKeyOf = (block) => {
@@ -403,12 +457,22 @@
       return null;
     };
 
+    // 图片块自身就是 block 节点；.ace-line 需要向上找 block 容器
+    const blockOf = (node) => {
+      if (
+        node.getAttribute &&
+        node.getAttribute("data-block-type") === "image"
+      ) {
+        return node;
+      }
+      return node.closest("[data-record-id], [data-block-id]");
+    };
+
     // 步骤1：按 DOM 先序拿到当前可见 block 的 key 序列（每个 block 只记一次）
     const visibleSeq = [];
     const visibleSeen = new Set();
-    lines.forEach((line) => {
-      const block = line.closest("[data-record-id], [data-block-id]");
-      const key = blockKeyOf(block);
+    nodes.forEach((node) => {
+      const key = blockKeyOf(blockOf(node));
       if (key && !visibleSeen.has(key)) {
         visibleSeen.add(key);
         visibleSeq.push(key);
@@ -438,32 +502,48 @@
       lastIdx = insertIdx;
     }
 
-    // 步骤3：收集每个 .ace-line 的文本
-    lines.forEach((line) => {
-      const rect = line.getBoundingClientRect();
+    // 步骤3：收集每个节点（.ace-line 或图片块）的文本
+    nodes.forEach((node) => {
+      const rect = node.getBoundingClientRect();
       const absY = rect.top - cRectTop + cScrollTop;
 
-      const block = line.closest("[data-record-id], [data-block-id]");
+      const isImg =
+        node.getAttribute && node.getAttribute("data-block-type") === "image";
+      const block = isImg
+        ? node
+        : node.closest("[data-record-id], [data-block-id]");
       const blockKey = blockKeyOf(block) || "r";
-      const numWrap = line.querySelector("[data-line-num]");
-      const lineNum = numWrap
-        ? parseInt(numWrap.getAttribute("data-line-num"), 10) || 0
-        : 0;
+
+      let lineNum = 0;
       let lineIdx = 0;
-      if (!lineNum && block) {
-        const ls = block.querySelectorAll(".ace-line");
-        lineIdx = Array.prototype.indexOf.call(ls, line);
+      if (!isImg) {
+        const numWrap = node.querySelector("[data-line-num]");
+        lineNum = numWrap
+          ? parseInt(numWrap.getAttribute("data-line-num"), 10) || 0
+          : 0;
+        if (!lineNum && block) {
+          const ls = block.querySelectorAll(".ace-line");
+          lineIdx = Array.prototype.indexOf.call(ls, node);
+        }
       }
       const uniqueKey = `${blockKey}#${lineNum}#${lineIdx}`;
 
-      const text = line.innerText || line.textContent || "";
-
       const existing = map.get(uniqueKey);
+
+      // first-wins：已存在且非空时不再覆盖
+      // 防止虚拟列表 re-render 时用可能不完整的二次结果覆盖第一次的完整结果
+      if (existing && existing.text) {
+        if (absY < existing.y) existing.y = absY;
+        return;
+      }
+
+      const text = nodeToTextWithImages(node);
+
       if (!existing) {
         map.set(uniqueKey, { blockKey, lineNum, lineIdx, y: absY, text });
       } else {
         if (absY < existing.y) existing.y = absY;
-        if (text || !existing.text) existing.text = text;
+        existing.text = text;
       }
     });
   };
@@ -509,20 +589,38 @@
     setTimeout(() => el.remove(), delay);
   };
 
-  let copyAllBtn = null;
+  // 运行锁：滚动收集要好几秒，期间禁用按钮防止用户重复触发
+  const btnElements = {};
+  let isRunning = false;
+
+  const lockButton = () => {
+    isRunning = true;
+    Object.values(btnElements).forEach((btn) => {
+      btn.disabled = true;
+      btn.style.opacity = "0.6";
+      btn.dataset.original = btn.innerHTML;
+      btn.innerHTML = "⏳ 滚动中…";
+    });
+  };
+
+  const unlockButton = () => {
+    Object.values(btnElements).forEach((btn) => {
+      btn.disabled = false;
+      btn.style.opacity = "1";
+      if (btn.dataset.original) btn.innerHTML = btn.dataset.original;
+    });
+    isRunning = false;
+  };
+
   const startCopyAll = async () => {
-    if (copyAllBtn) {
-      copyAllBtn.disabled = true;
-      copyAllBtn.style.opacity = "0.6";
-      copyAllBtn.dataset.original = copyAllBtn.innerHTML;
-      copyAllBtn.innerHTML = "⏳ 滚动中…";
-    }
+    if (isRunning) return;
+    lockButton();
 
     const container = findScrollContainer();
     if (!container) {
       setProgress("未找到文档滚动容器");
       closeProgress(1800);
-      restoreBtn();
+      unlockButton();
       return;
     }
     const originalScrollTop = container.scrollTop;
@@ -580,19 +678,22 @@
         if (a.lineIdx !== b.lineIdx) return a.lineIdx - b.lineIdx;
         return a.y - b.y;
       });
-      const text = sortedItems
+
+      const outputText = sortedItems
         .map((it) => it.text)
         .join("\n")
         .replace(/\n{3,}/g, "\n\n");
 
-      if (!text.trim()) {
+      if (!outputText.trim()) {
         setProgress("没有收集到任何内容");
         closeProgress(2000);
         return;
       }
 
-      await writeToClipboard(text);
-      setProgress(`✓ 已复制全文：${sortedItems.length} 行 / ${text.length} 字`);
+      await writeToClipboard(outputText);
+      setProgress(
+        `✓ 已复制：${sortedItems.length} 行 / ${outputText.length} 字`,
+      );
       closeProgress(2800);
     } catch (err) {
       console.error("[unlock-copy] copyAll 失败", err);
@@ -600,47 +701,50 @@
       closeProgress(3000);
     } finally {
       container.scrollTop = originalScrollTop;
-      restoreBtn();
+      unlockButton();
     }
   };
-  const restoreBtn = () => {
-    if (!copyAllBtn) return;
-    copyAllBtn.disabled = false;
-    copyAllBtn.style.opacity = "1";
-    if (copyAllBtn.dataset.original)
-      copyAllBtn.innerHTML = copyAllBtn.dataset.original;
-  };
+
+  const COPY_BTN_ID = "__unlock_copy_btn__";
 
   const ensureCopyAllButton = () => {
     if (!document.body) return;
-    const hasContent = document.querySelector(".ace-line, [data-line-num]");
+    const hasContent = document.querySelector(
+      ".ace-line, [data-line-num], [data-block-type='image']",
+    );
 
-    if (!copyAllBtn) {
-      copyAllBtn = document.createElement("button");
-      copyAllBtn.id = "__unlock_copy_all_btn__";
-      copyAllBtn.innerHTML = "📋 复制全部";
-      copyAllBtn.title = "滚动整个文档并复制全部内容到剪贴板";
-      copyAllBtn.style.cssText = `
-                position: fixed; z-index: 999998; right: 16px; bottom: 60px;
-                padding: 9px 16px; border-radius: 22px; border: none;
-                background: #3370ff; color: #fff; font-size: 13px; font-weight: 500;
-                font-family: -apple-system, system-ui, sans-serif;
-                cursor: pointer; box-shadow: 0 4px 12px rgba(51,112,255,.35);
-                transition: transform .15s ease, box-shadow .15s ease;
-                user-select: none;
-            `;
-      copyAllBtn.addEventListener("mouseenter", () => {
-        copyAllBtn.style.transform = "translateY(-2px)";
-        copyAllBtn.style.boxShadow = "0 6px 18px rgba(51,112,255,.5)";
+    if (!btnElements[COPY_BTN_ID]) {
+      const btn = document.createElement("button");
+      btn.id = COPY_BTN_ID;
+      btn.innerHTML = "📋 复制全部";
+      btn.title =
+        "滚动整个文档并复制为纯文本，图片以 ![alt](url) 形式插入。\n注意：图片链接需登录态才能访问。";
+      const baseShadow = "0 4px 12px rgba(51,112,255,.35)";
+      const hoverShadow = "0 6px 18px rgba(51,112,255,.5)";
+      btn.style.cssText =
+        "position: fixed; z-index: 999998; right: 16px; bottom: 20px;" +
+        "background: #3370ff; box-shadow: " +
+        baseShadow +
+        ";" +
+        "padding: 9px 16px; border-radius: 22px; border: none;" +
+        "color: #fff; font-size: 13px; font-weight: 500;" +
+        "font-family: -apple-system, system-ui, sans-serif;" +
+        "cursor: pointer; user-select: none;" +
+        "transition: transform .15s ease, box-shadow .15s ease;";
+      btn.addEventListener("mouseenter", () => {
+        if (btn.disabled) return;
+        btn.style.transform = "translateY(-2px)";
+        btn.style.boxShadow = hoverShadow;
       });
-      copyAllBtn.addEventListener("mouseleave", () => {
-        copyAllBtn.style.transform = "";
-        copyAllBtn.style.boxShadow = "0 4px 12px rgba(51,112,255,.35)";
+      btn.addEventListener("mouseleave", () => {
+        btn.style.transform = "";
+        btn.style.boxShadow = baseShadow;
       });
-      copyAllBtn.addEventListener("click", startCopyAll);
-      document.body.appendChild(copyAllBtn);
+      btn.addEventListener("click", startCopyAll);
+      document.body.appendChild(btn);
+      btnElements[COPY_BTN_ID] = btn;
     }
-    copyAllBtn.style.display = hasContent ? "" : "none";
+    btnElements[COPY_BTN_ID].style.display = hasContent ? "" : "none";
   };
 
   document.addEventListener("DOMContentLoaded", () => {
